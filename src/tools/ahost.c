@@ -27,7 +27,7 @@
 
 #include "ares_setup.h"
 
-#if !defined(WIN32) || defined(WATT32)
+#if !defined(_WIN32) || defined(WATT32)
 #  include <netinet/in.h>
 #  include <arpa/inet.h>
 #  include <netdb.h>
@@ -41,37 +41,41 @@
 #include "ares_dns.h"
 #include "ares_getopt.h"
 #include "ares_ipv6.h"
-#include "ares_nowarn.h"
 
-#ifndef HAVE_STRDUP
-#  include "ares_strdup.h"
-#  define strdup(ptr) ares_strdup(ptr)
-#endif
+#include "ares_str.h"
 
-#ifndef HAVE_STRCASECMP
-#  include "ares_strcasecmp.h"
-#  define strcasecmp(p1, p2) ares_strcasecmp(p1, p2)
-#endif
+#define RV_OK     0 /* Success */
+#define RV_SYSERR 1 /* Internal system failure */
+#define RV_MISUSE 2 /* Misuse (command line) */
+#define RV_FAIL   3 /* Resolution failure */
+static int final_rv = RV_OK;
 
-#ifndef HAVE_STRNCASECMP
-#  include "ares_strcasecmp.h"
-#  define strncasecmp(p1, p2, n) ares_strncasecmp(p1, p2, n)
-#endif
 
 static void callback(void *arg, int status, int timeouts, struct hostent *host);
+static void ai_callback(void *arg, int status, int timeouts,
+                        struct ares_addrinfo *result);
 static void usage(void);
 static void print_help_info_ahost(void);
+
+
 
 int         main(int argc, char **argv)
 {
   struct ares_options  options;
   int                  optmask = 0;
-  ares_channel         channel;
-  int                  status, nfds, c, addr_family = AF_INET;
-  fd_set               read_fds, write_fds;
-  struct timeval      *tvp, tv;
+  ares_channel_t      *channel;
+  int                  status;
+  int                  nfds;
+  int                  c;
+  int                  addr_family = AF_UNSPEC;
+  fd_set               read_fds;
+  fd_set               write_fds;
+  struct timeval      *tvp;
+  struct timeval       tv;
   struct in_addr       addr4;
   struct ares_in6_addr addr6;
+  ares_getopt_state_t  state;
+  char                *servers = NULL;
 
 #ifdef USE_WINSOCK
   WORD    wVersionRequested = MAKEWORD(USE_WINSOCK, USE_WINSOCK);
@@ -84,37 +88,47 @@ int         main(int argc, char **argv)
   status = ares_library_init(ARES_LIB_INIT_ALL);
   if (status != ARES_SUCCESS) {
     fprintf(stderr, "ares_library_init: %s\n", ares_strerror(status));
-    return 1;
+    return RV_SYSERR;
   }
 
-  while ((c = ares_getopt(argc, argv, "dt:h?s:")) != -1) {
+  ares_getopt_init(&state, argc, (const char * const *)argv);
+  while ((c = ares_getopt(&state, "dt:h?D:s:")) != -1) {
     switch (c) {
       case 'd':
 #ifdef WATT32
         dbug_init();
 #endif
         break;
-      case 's':
+      case 'D':
         optmask |= ARES_OPT_DOMAINS;
         options.ndomains++;
         options.domains = (char **)realloc(
           options.domains, (size_t)options.ndomains * sizeof(char *));
-        options.domains[options.ndomains - 1] = strdup(optarg);
+        options.domains[options.ndomains - 1] = strdup(state.optarg);
         break;
       case 't':
-        if (!strcasecmp(optarg, "a")) {
+        if (ares_strcaseeq(state.optarg, "a")) {
           addr_family = AF_INET;
-        } else if (!strcasecmp(optarg, "aaaa")) {
+        } else if (ares_strcaseeq(state.optarg, "aaaa")) {
           addr_family = AF_INET6;
-        } else if (!strcasecmp(optarg, "u")) {
+        } else if (ares_strcaseeq(state.optarg, "u")) {
           addr_family = AF_UNSPEC;
         } else {
           usage();
         }
         break;
-      case 'h':
-        print_help_info_ahost();
+      case 's':
+        if (state.optarg == NULL) {
+          fprintf(stderr, "%s", "missing servers");
+          usage();
+          break;
+        }
+        if (servers) {
+          free(servers);
+        }
+        servers = strdup(state.optarg);
         break;
+      case 'h':
       case '?':
         print_help_info_ahost();
         break;
@@ -124,16 +138,28 @@ int         main(int argc, char **argv)
     }
   }
 
-  argc -= optind;
-  argv += optind;
+  argc -= state.optind;
+  argv += state.optind;
   if (argc < 1) {
     usage();
   }
 
   status = ares_init_options(&channel, &options, optmask);
   if (status != ARES_SUCCESS) {
+    free(servers);
     fprintf(stderr, "ares_init: %s\n", ares_strerror(status));
-    return 1;
+    return RV_SYSERR;
+  }
+
+  if (servers) {
+    status = ares_set_servers_csv(channel, servers);
+    if (status != ARES_SUCCESS) {
+      fprintf(stderr, "ares_set_serveres_csv: %s\n", ares_strerror(status));
+      free(servers);
+      usage();
+      return RV_MISUSE;
+    }
+    free(servers);
   }
 
   /* Initiate the queries, one per command-line argument. */
@@ -145,7 +171,10 @@ int         main(int argc, char **argv)
       ares_gethostbyaddr(channel, &addr6, sizeof(addr6), AF_INET6, callback,
                          *argv);
     } else {
-      ares_gethostbyname(channel, *argv, addr_family, callback, *argv);
+      struct ares_addrinfo_hints hints;
+      memset(&hints, 0, sizeof(hints));
+      hints.ai_family = addr_family;
+      ares_getaddrinfo(channel, *argv, NULL, &hints, ai_callback, *argv);
     }
   }
 
@@ -177,7 +206,7 @@ int         main(int argc, char **argv)
   WSACleanup();
 #endif
 
-  return 0;
+  return final_rv;
 }
 
 static void callback(void *arg, int status, int timeouts, struct hostent *host)
@@ -188,6 +217,7 @@ static void callback(void *arg, int status, int timeouts, struct hostent *host)
 
   if (status != ARES_SUCCESS) {
     fprintf(stderr, "%s: %s\n", (char *)arg, ares_strerror(status));
+    final_rv = RV_FAIL;
     return;
   }
 
@@ -196,46 +226,72 @@ static void callback(void *arg, int status, int timeouts, struct hostent *host)
 
     ares_inet_ntop(host->h_addrtype, *p, addr_buf, sizeof(addr_buf));
     printf("%-32s\t%s", host->h_name, addr_buf);
-#if 0
-      if (host->h_aliases[0])
-        {
-           int i;
-
-           printf (", Aliases: ");
-           for (i = 0; host->h_aliases[i]; i++)
-               printf("%s ", host->h_aliases[i]);
-        }
-#endif
     puts("");
   }
 }
 
+static void ai_callback(void *arg, int status, int timeouts,
+                        struct ares_addrinfo *result)
+{
+  struct ares_addrinfo_node *node = NULL;
+  (void)timeouts;
+
+
+  if (status != ARES_SUCCESS) {
+    fprintf(stderr, "%s: %s\n", (char *)arg, ares_strerror(status));
+    final_rv = RV_FAIL;
+    return;
+  }
+
+  for (node = result->nodes; node != NULL; node = node->ai_next) {
+    char        addr_buf[64] = "";
+    const void *ptr          = NULL;
+    if (node->ai_family == AF_INET) {
+      const struct sockaddr_in *in_addr =
+        (const struct sockaddr_in *)((void *)node->ai_addr);
+      ptr = &in_addr->sin_addr;
+    } else if (node->ai_family == AF_INET6) {
+      const struct sockaddr_in6 *in_addr =
+        (const struct sockaddr_in6 *)((void *)node->ai_addr);
+      ptr = &in_addr->sin6_addr;
+    } else {
+      continue;
+    }
+    ares_inet_ntop(node->ai_family, ptr, addr_buf, sizeof(addr_buf));
+    printf("%-32s\t%s\n", result->name, addr_buf);
+  }
+
+  ares_freeaddrinfo(result);
+}
+
 static void usage(void)
 {
-  fprintf(
-    stderr,
-    "usage: ahost [-h] [-d] [-s {domain}] [-t {a|aaaa|u}] {host|addr} ...\n");
-  exit(1);
+  fprintf(stderr, "usage: ahost [-h] [-d] [[-D {domain}] ...] [-s {server}] "
+                  "[-t {a|aaaa|u}] {host|addr} ...\n");
+  exit(RV_MISUSE);
 }
 
 /* Information from the man page. Formatting taken from man -h */
 static void print_help_info_ahost(void)
 {
+  /* Split due to maximum c89 string literal of 509 bytes */
   printf("ahost, version %s\n\n", ARES_VERSION_STR);
   printf(
-    "usage: ahost [-h] [-d] [[-s domain] ...] [-t a|aaaa|u] host|addr ...\n\n"
-    "  h : Display this help and exit.\n"
-    "  d : Print some extra debugging output.\n\n"
-    "  s domain : Specify the domain to search instead of using the default "
-    "values\n"
-    "               from /etc/resolv.conf. This option only has an effect on\n"
-    "               platforms that use /etc/resolv.conf for DNS "
-    "configuration;\n"
-    "               it has no effect on other platforms (such as Win32 or "
-    "Android).\n\n"
-    "  t type   : If type is \"a\", print the A record (default).\n"
-    "               If type is \"aaaa\", print the AAAA record.\n"
-    "               If type is \"u\", look for either AAAA or A record (in "
-    "that order).\n\n");
-  exit(0);
+    "usage: ahost [-h] [-d] [-D domain] [-s server] [-t a|aaaa|u] host|addr "
+    "...\n\n");
+  printf(
+    "  -h : Display this help and exit.\n"
+    "  -d : Print some extra debugging output.\n\n"
+    "  -D domain : Specify the domain to search instead of using the default "
+    "values\n");
+  printf(
+    "  -s server : Connect to the specified DNS server, instead of the\n"
+    "              system's default one(s). Servers are tried in round-robin,\n"
+    "              if the previous one failed.\n"
+    "  -t type   : If type is \"a\", print the A record.\n");
+  printf(
+    "              If type is \"aaaa\", print the AAAA record.\n"
+    "              If type is \"u\" (default), print both A and AAAA records.\n"
+    "\n");
+  exit(RV_OK);
 }

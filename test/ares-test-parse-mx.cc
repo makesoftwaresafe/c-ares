@@ -1,17 +1,25 @@
-/*
- * Copyright (C) The c-ares project
+/* MIT License
  *
- * Permission to use, copy, modify, and distribute this
- * software and its documentation for any purpose and without
- * fee is hereby granted, provided that the above copyright
- * notice appear in all copies and that both that copyright
- * notice and this permission notice appear in supporting
- * documentation, and that the name of M.I.T. not be used in
- * advertising or publicity pertaining to distribution of the
- * software without specific, written prior permission.
- * M.I.T. makes no representations about the suitability of
- * this software for any purpose.  It is provided "as is"
- * without express or implied warranty.
+ * Copyright (c) The c-ares project and its contributors
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -33,7 +41,7 @@ TEST_F(LibraryTest, ParseMxReplyOK) {
   std::vector<byte> data = pkt.data();
 
   struct ares_mx_reply* mx = nullptr;
-  EXPECT_EQ(ARES_SUCCESS, ares_parse_mx_reply(data.data(), data.size(), &mx));
+  EXPECT_EQ(ARES_SUCCESS, ares_parse_mx_reply(data.data(), (int)data.size(), &mx));
   ASSERT_NE(nullptr, mx);
   EXPECT_EQ("mx1.example.com", std::string(mx->host));
   EXPECT_EQ(100, mx->priority);
@@ -74,7 +82,7 @@ TEST_F(LibraryTest, ParseMxReplyMalformed) {
   };
 
   struct ares_mx_reply* mx = nullptr;
-  EXPECT_EQ(ARES_EBADRESP, ares_parse_mx_reply(data.data(), data.size(), &mx));
+  EXPECT_EQ(ARES_EBADRESP, ares_parse_mx_reply(data.data(), (int)data.size(), &mx));
   ASSERT_EQ(nullptr, mx);
 }
 
@@ -90,7 +98,7 @@ TEST_F(LibraryTest, ParseMxReplyErrors) {
   // No question.
   pkt.questions_.clear();
   data = pkt.data();
-  EXPECT_EQ(ARES_EBADRESP, ares_parse_mx_reply(data.data(), data.size(), &mx));
+  EXPECT_EQ(ARES_EBADRESP, ares_parse_mx_reply(data.data(), (int)data.size(), &mx));
   EXPECT_EQ(nullptr, mx);
   pkt.add_question(new DNSQuestion("example.com", T_MX));
 
@@ -99,7 +107,7 @@ TEST_F(LibraryTest, ParseMxReplyErrors) {
   pkt.questions_.clear();
   pkt.add_question(new DNSQuestion("Axample.com", T_MX));
   data = pkt.data();
-  EXPECT_EQ(ARES_EBADRESP, ares_parse_mx_reply(data.data(), data.size(), &mx));
+  EXPECT_EQ(ARES_EBADRESP, ares_parse_mx_reply(data.data(), (int)data.size(), &mx));
   pkt.questions_.clear();
   pkt.add_question(new DNSQuestion("example.com", T_MX));
 #endif
@@ -107,7 +115,7 @@ TEST_F(LibraryTest, ParseMxReplyErrors) {
   // Two questions.
   pkt.add_question(new DNSQuestion("example.com", T_MX));
   data = pkt.data();
-  EXPECT_EQ(ARES_EBADRESP, ares_parse_mx_reply(data.data(), data.size(), &mx));
+  EXPECT_EQ(ARES_EBADRESP, ares_parse_mx_reply(data.data(), (int)data.size(), &mx));
   EXPECT_EQ(nullptr, mx);
   pkt.questions_.clear();
   pkt.add_question(new DNSQuestion("example.com", T_MX));
@@ -117,7 +125,7 @@ TEST_F(LibraryTest, ParseMxReplyErrors) {
   pkt.answers_.clear();
   pkt.add_answer(new DNSSrvRR("example.abc.def.com", 180, 0, 10, 8160, "example.abc.def.com"));
   data = pkt.data();
-  EXPECT_EQ(ARES_SUCCESS, ares_parse_mx_reply(data.data(), data.size(), &mx));
+  EXPECT_EQ(ARES_SUCCESS, ares_parse_mx_reply(data.data(), (int)data.size(), &mx));
   EXPECT_EQ(nullptr, mx);
   pkt.answers_.clear();
   pkt.add_answer(new DNSMxRR("example.com", 100, 100, "mx1.example.com"));
@@ -125,17 +133,20 @@ TEST_F(LibraryTest, ParseMxReplyErrors) {
   // No answer.
   pkt.answers_.clear();
   data = pkt.data();
-  EXPECT_EQ(ARES_ENODATA, ares_parse_mx_reply(data.data(), data.size(), &mx));
+  EXPECT_EQ(ARES_ENODATA, ares_parse_mx_reply(data.data(), (int)data.size(), &mx));
   EXPECT_EQ(nullptr, mx);
   pkt.add_answer(new DNSMxRR("example.com", 100, 100, "mx1.example.com"));
 
   // Truncated packets.
   data = pkt.data();
   for (size_t len = 1; len < data.size(); len++) {
-    int rc = ares_parse_mx_reply(data.data(), len, &mx);
+    int rc = ares_parse_mx_reply(data.data(), (int)len, &mx);
     EXPECT_EQ(nullptr, mx);
     EXPECT_TRUE(rc == ARES_EBADRESP || rc == ARES_EBADNAME);
   }
+
+  // Negative Length
+  EXPECT_EQ(ARES_EBADRESP, ares_parse_mx_reply(data.data(), -1, &mx));
 }
 
 TEST_F(LibraryTest, ParseMxReplyAllocFail) {
@@ -150,7 +161,7 @@ TEST_F(LibraryTest, ParseMxReplyAllocFail) {
   for (int ii = 1; ii <= 5; ii++) {
     ClearFails();
     SetAllocFail(ii);
-    EXPECT_EQ(ARES_ENOMEM, ares_parse_mx_reply(data.data(), data.size(), &mx)) << ii;
+    EXPECT_EQ(ARES_ENOMEM, ares_parse_mx_reply(data.data(), (int)data.size(), &mx)) << ii;
   }
 }
 

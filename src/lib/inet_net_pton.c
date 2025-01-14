@@ -18,7 +18,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "ares_setup.h"
+#include "ares_private.h"
 
 #ifdef HAVE_NETINET_IN_H
 #  include <netinet/in.h>
@@ -29,12 +29,22 @@
 
 #include "ares_nameser.h"
 
-#include "ares.h"
 #include "ares_ipv6.h"
-#include "ares_nowarn.h"
 #include "ares_inet_net_pton.h"
-#include "ares_private.h"
 
+#ifdef USE_WINSOCK
+#  define SOCKERRNO        ((int)WSAGetLastError())
+#  define SET_SOCKERRNO(x) (WSASetLastError((int)(x)))
+#  undef EMSGSIZE
+#  define EMSGSIZE WSAEMSGSIZE
+#  undef ENOENT
+#  define ENOENT WSA_INVALID_PARAMETER
+#  undef EAFNOSUPPORT
+#  define EAFNOSUPPORT WSAEAFNOSUPPORT
+#else
+#  define SOCKERRNO        (errno)
+#  define SET_SOCKERRNO(x) (errno = (x))
+#endif
 
 const struct ares_in6_addr ares_in6addr_any = { { { 0, 0, 0, 0, 0, 0, 0, 0, 0,
                                                     0, 0, 0, 0, 0, 0, 0 } } };
@@ -54,9 +64,9 @@ const struct ares_in6_addr ares_in6addr_any = { { { 0, 0, 0, 0, 0, 0, 0, 0, 0,
  *      0b11110000 in its fourth octet.
  * note:
  *      On Windows we store the error in the thread errno, not
- *      in the winsock error code. This is to avoid loosing the
+ *      in the winsock error code. This is to avoid losing the
  *      actual last winsock error. So use macro ERRNO to fetch the
- *      errno this funtion sets when returning (-1), not SOCKERRNO.
+ *      errno this function sets when returning (-1), not SOCKERRNO.
  * author:
  *      Paul Vixie (ISC), June 1996
  */
@@ -65,23 +75,27 @@ static int ares_inet_net_pton_ipv4(const char *src, unsigned char *dst,
 {
   static const char    xdigits[] = "0123456789abcdef";
   static const char    digits[]  = "0123456789";
-  int                  n, ch, tmp = 0, dirty, bits;
+  int                  n;
+  int                  ch;
+  int                  tmp = 0;
+  int                  dirty;
+  int                  bits;
   const unsigned char *odst = dst;
 
   ch = *src++;
-  if (ch == '0' && (src[0] == 'x' || src[0] == 'X') && ISASCII(src[1]) &&
-      ISXDIGIT(src[1])) {
+  if (ch == '0' && (src[0] == 'x' || src[0] == 'X') && ares_isascii(src[1]) &&
+      ares_isxdigit(src[1])) {
     /* Hexadecimal: Eat nybble string. */
     if (!size) {
       goto emsgsize;
     }
     dirty = 0;
     src++; /* skip x or X. */
-    while ((ch = *src++) != '\0' && ISASCII(ch) && ISXDIGIT(ch)) {
-      if (ISUPPER(ch)) {
-        ch = tolower(ch);
+    while ((ch = *src++) != '\0' && ares_isascii(ch) && ares_isxdigit(ch)) {
+      if (ares_isupper(ch)) {
+        ch = ares_tolower((unsigned char)ch);
       }
-      n = aresx_sztosi(strchr(xdigits, ch) - xdigits);
+      n = (int)(strchr(xdigits, ch) - xdigits);
       if (dirty == 0) {
         tmp = n;
       } else {
@@ -101,18 +115,18 @@ static int ares_inet_net_pton_ipv4(const char *src, unsigned char *dst,
       }
       *dst++ = (unsigned char)(tmp << 4);
     }
-  } else if (ISASCII(ch) && ISDIGIT(ch)) {
+  } else if (ares_isascii(ch) && ares_isdigit(ch)) {
     /* Decimal: eat dotted digit string. */
     for (;;) {
       tmp = 0;
       do {
-        n    = aresx_sztosi(strchr(digits, ch) - digits);
+        n    = (int)(strchr(digits, ch) - digits);
         tmp *= 10;
         tmp += n;
         if (tmp > 255) {
           goto enoent;
         }
-      } while ((ch = *src++) != '\0' && ISASCII(ch) && ISDIGIT(ch));
+      } while ((ch = *src++) != '\0' && ares_isascii(ch) && ares_isdigit(ch));
       if (!size--) {
         goto emsgsize;
       }
@@ -124,7 +138,7 @@ static int ares_inet_net_pton_ipv4(const char *src, unsigned char *dst,
         goto enoent;
       }
       ch = *src++;
-      if (!ISASCII(ch) || !ISDIGIT(ch)) {
+      if (!ares_isascii(ch) || !ares_isdigit(ch)) {
         goto enoent;
       }
     }
@@ -133,18 +147,18 @@ static int ares_inet_net_pton_ipv4(const char *src, unsigned char *dst,
   }
 
   bits = -1;
-  if (ch == '/' && ISASCII(src[0]) && ISDIGIT(src[0]) && dst > odst) {
+  if (ch == '/' && ares_isascii(src[0]) && ares_isdigit(src[0]) && dst > odst) {
     /* CIDR width specifier.  Nothing can follow it. */
     ch   = *src++; /* Skip over the /. */
     bits = 0;
     do {
-      n     = aresx_sztosi(strchr(digits, ch) - digits);
+      n     = (int)(strchr(digits, ch) - digits);
       bits *= 10;
       bits += n;
       if (bits > 32) {
         goto enoent;
       }
-    } while ((ch = *src++) != '\0' && ISASCII(ch) && ISDIGIT(ch));
+    } while ((ch = *src++) != '\0' && ares_isascii(ch) && ares_isdigit(ch));
     if (ch != '\0') {
       goto enoent;
     }
@@ -174,7 +188,7 @@ static int ares_inet_net_pton_ipv4(const char *src, unsigned char *dst,
     }
     /* If imputed mask is narrower than specified octets, widen. */
     if (bits < ((dst - odst) * 8)) {
-      bits = aresx_sztosi(dst - odst) * 8;
+      bits = (int)(dst - odst) * 8;
     }
     /*
      * If there are no additional bits specified for a class D
@@ -191,15 +205,15 @@ static int ares_inet_net_pton_ipv4(const char *src, unsigned char *dst,
     }
     *dst++ = '\0';
   }
-  return (bits);
+  return bits;
 
 enoent:
-  SET_ERRNO(ENOENT);
-  return (-1);
+  SET_SOCKERRNO(ENOENT);
+  return -1;
 
 emsgsize:
-  SET_ERRNO(EMSGSIZE);
-  return (-1);
+  SET_SOCKERRNO(EMSGSIZE);
+  return -1;
 }
 
 static int getbits(const char *src, size_t *bitsp)
@@ -217,32 +231,38 @@ static int getbits(const char *src, size_t *bitsp)
     pch = strchr(digits, ch);
     if (pch != NULL) {
       if (n++ != 0 && val == 0) { /* no leading zeros */
-        return (0);
+        return 0;
       }
       val *= 10;
       val += (size_t)(pch - digits);
       if (val > 128) { /* range */
-        return (0);
+        return 0;
       }
       continue;
     }
-    return (0);
+    return 0;
   }
   if (n == 0) {
-    return (0);
+    return 0;
   }
   *bitsp = val;
-  return (1);
+  return 1;
 }
 
 static int ares_inet_pton6(const char *src, unsigned char *dst)
 {
-  static const char xdigits_l[] = "0123456789abcdef",
-                    xdigits_u[] = "0123456789ABCDEF";
-  unsigned char tmp[NS_IN6ADDRSZ], *tp, *endp, *colonp;
-  const char   *xdigits, *curtok;
-  int           ch, saw_xdigit, count_xdigit;
-  unsigned int  val;
+  static const char xdigits_l[] = "0123456789abcdef";
+  static const char xdigits_u[] = "0123456789ABCDEF";
+  unsigned char     tmp[NS_IN6ADDRSZ];
+  unsigned char    *tp;
+  unsigned char    *endp;
+  unsigned char    *colonp;
+  const char       *xdigits;
+  const char       *curtok;
+  int               ch;
+  int               saw_xdigit;
+  int               count_xdigit;
+  unsigned int      val;
 
   memset((tp = tmp), '\0', NS_IN6ADDRSZ);
   endp   = tp + NS_IN6ADDRSZ;
@@ -333,11 +353,11 @@ static int ares_inet_pton6(const char *src, unsigned char *dst)
   }
 
   memcpy(dst, tmp, NS_IN6ADDRSZ);
-  return (1);
+  return 1;
 
 enoent:
-  SET_ERRNO(ENOENT);
-  return (-1);
+  SET_SOCKERRNO(ENOENT);
+  return -1;
 }
 
 static int ares_inet_net_pton_ipv6(const char *src, unsigned char *dst,
@@ -351,8 +371,8 @@ static int ares_inet_net_pton_ipv6(const char *src, unsigned char *dst,
   char                *sep;
 
   if (ares_strlen(src) >= sizeof buf) {
-    SET_ERRNO(EMSGSIZE);
-    return (-1);
+    SET_SOCKERRNO(EMSGSIZE);
+    return -1;
   }
   ares_strcpy(buf, src, sizeof buf);
 
@@ -363,22 +383,22 @@ static int ares_inet_net_pton_ipv6(const char *src, unsigned char *dst,
 
   ret = ares_inet_pton6(buf, (unsigned char *)&in6);
   if (ret != 1) {
-    return (-1);
+    return -1;
   }
 
   if (sep == NULL) {
     bits = 128;
   } else {
     if (!getbits(sep, &bits)) {
-      SET_ERRNO(ENOENT);
-      return (-1);
+      SET_SOCKERRNO(ENOENT);
+      return -1;
     }
   }
 
   bytes = (bits + 7) / 8;
   if (bytes > size) {
-    SET_ERRNO(EMSGSIZE);
-    return (-1);
+    SET_SOCKERRNO(EMSGSIZE);
+    return -1;
   }
   memcpy(dst, &in6, bytes);
   return (int)bits;
@@ -394,24 +414,19 @@ static int ares_inet_net_pton_ipv6(const char *src, unsigned char *dst,
  *      number of bits, either imputed classfully or specified with /CIDR,
  *      or -1 if some failure occurred (check errno).  ENOENT means it was
  *      not a valid network specification.
- * note:
- *      On Windows we store the error in the thread errno, not
- *      in the winsock error code. This is to avoid loosing the
- *      actual last winsock error. So use macro ERRNO to fetch the
- *      errno this funtion sets when returning (-1), not SOCKERRNO.
  * author:
  *      Paul Vixie (ISC), June 1996
+ *
  */
 int ares_inet_net_pton(int af, const char *src, void *dst, size_t size)
 {
   switch (af) {
     case AF_INET:
-      return (ares_inet_net_pton_ipv4(src, dst, size));
+      return ares_inet_net_pton_ipv4(src, dst, size);
     case AF_INET6:
-      return (ares_inet_net_pton_ipv6(src, dst, size));
+      return ares_inet_net_pton_ipv6(src, dst, size);
     default:
-      SET_ERRNO(EAFNOSUPPORT);
-      return (-1);
+      return -1;
   }
 }
 
@@ -425,12 +440,12 @@ int ares_inet_pton(int af, const char *src, void *dst)
   } else if (af == AF_INET6) {
     size = sizeof(struct ares_in6_addr);
   } else {
-    SET_ERRNO(EAFNOSUPPORT);
+    SET_SOCKERRNO(EAFNOSUPPORT);
     return -1;
   }
   result = ares_inet_net_pton(af, src, dst, size);
-  if (result == -1 && ERRNO == ENOENT) {
+  if (result == -1 && SOCKERRNO == ENOENT) {
     return 0;
   }
-  return (result > -1 ? 1 : -1);
+  return (result > -1) ? 1 : -1;
 }

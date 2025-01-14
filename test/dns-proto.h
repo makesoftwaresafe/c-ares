@@ -1,18 +1,25 @@
-// -*- mode: c++ -*-
-/*
- * Copyright (C) The c-ares project
+/* MIT License
  *
- * Permission to use, copy, modify, and distribute this
- * software and its documentation for any purpose and without
- * fee is hereby granted, provided that the above copyright
- * notice appear in all copies and that both that copyright
- * notice and this permission notice appear in supporting
- * documentation, and that the name of M.I.T. not be used in
- * advertising or publicity pertaining to distribution of the
- * software without specific, written prior permission.
- * M.I.T. makes no representations about the suitability of
- * this software for any purpose.  It is provided "as is"
- * without express or implied warranty.
+ * Copyright (c) The c-ares project and its contributors
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -29,6 +36,9 @@
 #include <string>
 #include <vector>
 
+extern "C" void arestest_strtolower(char *dest, const char *src,
+                                    size_t dest_size);
+
 namespace ares {
 
 typedef unsigned char byte;
@@ -42,6 +52,8 @@ std::string           RcodeToString(int rcode);
 std::string           RRTypeToString(int rrtype);
 std::string           ClassToString(int qclass);
 std::string           AddressToString(const void *addr, int len);
+
+const ares_dns_rr_t  *fetch_rr_opt(const ares_dns_record_t *rec);
 
 // Convert DNS protocol data to strings.
 // Note that these functions are not defensive; they assume
@@ -74,10 +86,22 @@ struct DNSQuestion {
   {
   }
 
-  virtual std::vector<byte> data() const;
-  std::string               name_;
-  int                       rrtype_;
-  int                       qclass_;
+  virtual std::vector<byte> data(const char              *request_name,
+                                 const ares_dns_record_t *dnsrec) const;
+
+  virtual std::vector<byte> data(const ares_dns_record_t *dnsrec) const
+  {
+    return data(nullptr, dnsrec);
+  }
+
+  virtual std::vector<byte> data() const
+  {
+    return data(nullptr, nullptr);
+  }
+
+  std::string name_;
+  int         rrtype_;
+  int         qclass_;
 };
 
 struct DNSRR : public DNSQuestion {
@@ -95,7 +119,7 @@ struct DNSRR : public DNSQuestion {
   {
   }
 
-  virtual std::vector<byte> data() const = 0;
+  virtual std::vector<byte> data(const ares_dns_record_t *dnsrec) const = 0;
   int                       ttl_;
 };
 
@@ -112,7 +136,7 @@ struct DNSAddressRR : public DNSRR {
   {
   }
 
-  virtual std::vector<byte> data() const;
+  virtual std::vector<byte> data(const ares_dns_record_t *dnsrec) const;
   std::vector<byte>         addr_;
 };
 
@@ -147,7 +171,7 @@ struct DNSSingleNameRR : public DNSRR {
   {
   }
 
-  virtual std::vector<byte> data() const;
+  virtual std::vector<byte> data(const ares_dns_record_t *dnsrec) const;
   std::string               other_;
 };
 
@@ -179,7 +203,7 @@ struct DNSTxtRR : public DNSRR {
   {
   }
 
-  virtual std::vector<byte> data() const;
+  virtual std::vector<byte> data(const ares_dns_record_t *dnsrec) const;
   std::vector<std::string>  txt_;
 };
 
@@ -189,7 +213,7 @@ struct DNSMxRR : public DNSRR {
   {
   }
 
-  virtual std::vector<byte> data() const;
+  virtual std::vector<byte> data(const ares_dns_record_t *dnsrec) const;
   int                       pref_;
   std::string               other_;
 };
@@ -202,7 +226,7 @@ struct DNSSrvRR : public DNSRR {
   {
   }
 
-  virtual std::vector<byte> data() const;
+  virtual std::vector<byte> data(const ares_dns_record_t *dnsrec) const;
   int                       prio_;
   int                       weight_;
   int                       port_;
@@ -216,7 +240,7 @@ struct DNSUriRR : public DNSRR {
   {
   }
 
-  virtual std::vector<byte> data() const;
+  virtual std::vector<byte> data(const ares_dns_record_t *dnsrec) const;
   int                       prio_;
   int                       weight_;
   std::string               target_;
@@ -231,7 +255,7 @@ struct DNSSoaRR : public DNSRR {
   {
   }
 
-  virtual std::vector<byte> data() const;
+  virtual std::vector<byte> data(const ares_dns_record_t *dnsrec) const;
   std::string               nsname_;
   std::string               rname_;
   int                       serial_;
@@ -250,7 +274,7 @@ struct DNSNaptrRR : public DNSRR {
   {
   }
 
-  virtual std::vector<byte> data() const;
+  virtual std::vector<byte> data(const ares_dns_record_t *dnsrec) const;
   int                       order_;
   int                       pref_;
   std::string               flags_;
@@ -265,13 +289,23 @@ struct DNSOption {
 };
 
 struct DNSOptRR : public DNSRR {
-  DNSOptRR(int extrcode, int udpsize)
-    : DNSRR("", T_OPT, static_cast<int>(udpsize), extrcode)
+  DNSOptRR(unsigned char extrcode, unsigned char version, unsigned short flags,
+           int udpsize, std::vector<byte> client_cookie,
+           std::vector<byte> server_cookie, bool expect_server_cookie)
+    : DNSRR("", T_OPT, static_cast<int>(udpsize),
+            ((int)extrcode) << 24 | ((int)version) << 16 |
+              ((int)flags) /* ttl */)
   {
+    client_cookie_        = client_cookie;
+    server_cookie_        = server_cookie;
+    expect_server_cookie_ = expect_server_cookie;
   }
 
-  virtual std::vector<byte> data() const;
+  virtual std::vector<byte> data(const ares_dns_record_t *dnsrec) const;
   std::vector<DNSOption>    opts_;
+  std::vector<byte>         client_cookie_;
+  std::vector<byte>         server_cookie_;
+  bool                      expect_server_cookie_;
 };
 
 struct DNSPacket {
@@ -368,7 +402,13 @@ struct DNSPacket {
   }
 
   // Return the encoded packet.
-  std::vector<byte>                         data() const;
+  std::vector<byte> data(const char              *request_name,
+                         const ares_dns_record_t *dnsrec) const;
+
+  std::vector<byte> data() const
+  {
+    return data(nullptr, nullptr);
+  }
 
   int                                       qid_;
   bool                                      response_;
