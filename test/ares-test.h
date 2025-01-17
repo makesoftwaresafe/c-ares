@@ -1,17 +1,25 @@
-/*
- * Copyright (C) The c-ares project
+/* MIT License
  *
- * Permission to use, copy, modify, and distribute this
- * software and its documentation for any purpose and without
- * fee is hereby granted, provided that the above copyright
- * notice appear in all copies and that both that copyright
- * notice and this permission notice appear in supporting
- * documentation, and that the name of M.I.T. not be used in
- * advertising or publicity pertaining to distribution of the
- * software without specific, written prior permission.
- * M.I.T. makes no representations about the suitability of
- * this software for any purpose.  It is provided "as is"
- * without express or implied warranty.
+ * Copyright (c) The c-ares project and its contributors
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -20,8 +28,6 @@
 #define ARES_TEST_H
 
 #include "ares_setup.h"
-#include "ares.h"
-
 #include "dns-proto.h"
 // Include ares internal file for DNS protocol constants
 #include "ares_nameser.h"
@@ -29,9 +35,6 @@
 #include "gtest/gtest.h"
 #include "gmock/gmock.h"
 
-#ifdef HAVE_CONFIG_H
-#  include "config.h"
-#endif
 #if defined(HAVE_USER_NAMESPACE) && defined(HAVE_UTS_NAMESPACE)
 #  define HAVE_CONTAINER
 #endif
@@ -42,8 +45,21 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
+#include <chrono>
+
+#if defined(HAVE_CLOSESOCKET)
+#  define sclose(x) closesocket(x)
+#elif defined(HAVE_CLOSESOCKET_CAMEL)
+#  define sclose(x) CloseSocket(x)
+#elif defined(HAVE_CLOSE_S)
+#  define sclose(x) close_s(x)
+#else
+#  define sclose(x) close(x)
+#endif
 
 namespace ares {
 
@@ -52,7 +68,7 @@ typedef unsigned char byte;
 namespace test {
 
 extern bool                                    verbose;
-extern int                                     mock_port;
+extern unsigned short                          mock_port;
 extern const std::vector<int>                  both_families;
 extern const std::vector<int>                  ipv4_family;
 extern const std::vector<int>                  ipv6_family;
@@ -61,16 +77,39 @@ extern const std::vector<std::pair<int, bool>> both_families_both_modes;
 extern const std::vector<std::pair<int, bool>> ipv4_family_both_modes;
 extern const std::vector<std::pair<int, bool>> ipv6_family_both_modes;
 
+extern const std::vector<std::tuple<ares_evsys_t, int, bool>>
+  all_evsys_ipv4_family_both_modes;
+extern const std::vector<std::tuple<ares_evsys_t, int, bool>>
+  all_evsys_ipv6_family_both_modes;
+extern const std::vector<std::tuple<ares_evsys_t, int, bool>>
+  all_evsys_both_families_both_modes;
+
+extern const std::vector<std::tuple<ares_evsys_t, int>> all_evsys_ipv4_family;
+extern const std::vector<std::tuple<ares_evsys_t, int>> all_evsys_ipv6_family;
+extern const std::vector<std::tuple<ares_evsys_t, int>> all_evsys_both_families;
+
 // Which parameters to use in tests
-extern std::vector<int>                        families;
-extern std::vector<std::pair<int, bool>>       families_modes;
+extern std::vector<int>                                 families;
+extern std::vector<std::tuple<ares_evsys_t, int>>       evsys_families;
+extern std::vector<std::pair<int, bool>>                families_modes;
+extern std::vector<std::tuple<ares_evsys_t, int, bool>> evsys_families_modes;
+
+// Hopefully a more accurate sleep than sleep_for()
+void                    ares_sleep_time(unsigned int ms);
 
 // Process all pending work on ares-owned file descriptors, plus
 // optionally the given set-of-FDs + work function.
-void                                           ProcessWork(ares_channel                   channel,
-                                                           std::function<std::set<int>()> get_extrafds,
-                                                           std::function<void(int)>       process_extra);
-std::set<int>                                  NoExtraFDs();
+void                    ProcessWork(ares_channel_t                          *channel,
+                                    std::function<std::set<ares_socket_t>()> get_extrafds,
+                                    std::function<void(ares_socket_t)>       process_extra,
+                                    unsigned int                             cancel_ms = 0);
+std::set<ares_socket_t> NoExtraFDs();
+
+const char             *af_tostr(int af);
+const char             *mode_tostr(bool mode);
+std::string
+  PrintFamilyMode(const testing::TestParamInfo<std::pair<int, bool>> &info);
+std::string PrintFamily(const testing::TestParamInfo<int> &info);
 
 // Test fixture that ensures library initialization, and allows
 // memory allocations to be failed.
@@ -105,6 +144,7 @@ private:
   static bool                  ShouldAllocFail(size_t size);
   static unsigned long long    fails_;
   static std::map<size_t, int> size_fails_;
+  static std::mutex            lock_;
 };
 
 // Test fixture that uses a default channel.
@@ -112,7 +152,12 @@ class DefaultChannelTest : public LibraryTest {
 public:
   DefaultChannelTest() : channel_(nullptr)
   {
-    EXPECT_EQ(ARES_SUCCESS, ares_init(&channel_));
+    /* Enable query cache for live tests */
+    struct ares_options opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.qcache_max_ttl = 300;
+    int optmask         = ARES_OPT_QUERY_CACHE;
+    EXPECT_EQ(ARES_SUCCESS, ares_init_options(&channel_, &opts, optmask));
     EXPECT_NE(nullptr, channel_);
   }
 
@@ -123,10 +168,37 @@ public:
   }
 
   // Process all pending work on ares-owned file descriptors.
-  void Process();
+  void Process(unsigned int cancel_ms = 0);
 
 protected:
-  ares_channel channel_;
+  ares_channel_t *channel_;
+};
+
+// Test fixture that uses a file-only channel.
+class FileChannelTest : public LibraryTest {
+public:
+  FileChannelTest() : channel_(nullptr)
+  {
+    struct ares_options opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.lookups = strdup("f");
+    int optmask  = ARES_OPT_LOOKUPS;
+    EXPECT_EQ(ARES_SUCCESS, ares_init_options(&channel_, &opts, optmask));
+    EXPECT_NE(nullptr, channel_);
+    free(opts.lookups);
+  }
+
+  ~FileChannelTest()
+  {
+    ares_destroy(channel_);
+    channel_ = nullptr;
+  }
+
+  // Process all pending work on ares-owned file descriptors.
+  void Process(unsigned int cancel_ms = 0);
+
+protected:
+  ares_channel_t *channel_;
 };
 
 // Test fixture that uses a default channel with the specified lookup mode.
@@ -136,9 +208,10 @@ class DefaultChannelModeTest
 public:
   DefaultChannelModeTest() : channel_(nullptr)
   {
-    struct ares_options opts = { 0 };
-    opts.lookups             = strdup(GetParam().c_str());
-    int optmask              = ARES_OPT_LOOKUPS;
+    struct ares_options opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.lookups = strdup(GetParam().c_str());
+    int optmask  = ARES_OPT_LOOKUPS;
     EXPECT_EQ(ARES_SUCCESS, ares_init_options(&channel_, &opts, optmask));
     EXPECT_NE(nullptr, channel_);
     free(opts.lookups);
@@ -151,16 +224,16 @@ public:
   }
 
   // Process all pending work on ares-owned file descriptors.
-  void Process();
+  void Process(unsigned int cancel_ms = 0);
 
 protected:
-  ares_channel channel_;
+  ares_channel_t *channel_;
 };
 
 // Mock DNS server to allow responses to be scripted by tests.
 class MockServer {
 public:
-  MockServer(int family, int port);
+  MockServer(int family, unsigned short port);
   ~MockServer();
 
   // Mock method indicating the processing of a particular <name, RRtype>
@@ -171,12 +244,23 @@ public:
   // with the value from the request.
   void SetReplyData(const std::vector<byte> &reply)
   {
-    reply_ = reply;
+    exact_reply_ = reply;
+    reply_       = nullptr;
   }
 
   void SetReply(const DNSPacket *reply)
   {
-    SetReplyData(reply->data());
+    reply_ = reply;
+    exact_reply_.clear();
+  }
+
+  // Set the reply to be sent next as well as the request (in string form) that
+  // the server should expect to receive; the query ID field in the reply will
+  // be overwritten with the value from the request.
+  void SetReplyExpRequest(const DNSPacket *reply, const std::string &request)
+  {
+    expected_request_ = request;
+    reply_            = reply;
   }
 
   void SetReplyQID(int qid)
@@ -186,7 +270,9 @@ public:
 
   void Disconnect()
   {
-    for (int fd : connfds_) {
+    reply_ = nullptr;
+    exact_reply_.clear();
+    for (ares_socket_t fd : connfds_) {
       sclose(fd);
     }
     connfds_.clear();
@@ -196,63 +282,70 @@ public:
   }
 
   // The set of file descriptors that the server handles.
-  std::set<int> fds() const;
+  std::set<ares_socket_t> fds() const;
 
   // Process activity on a file descriptor.
-  void          ProcessFD(int fd);
+  void                    ProcessFD(ares_socket_t fd);
 
   // Ports the server is responding to
-  int           udpport() const
+  unsigned short          udpport() const
   {
     return udpport_;
   }
 
-  int tcpport() const
+  unsigned short tcpport() const
   {
     return tcpport_;
   }
 
 private:
-  void ProcessRequest(int fd, struct sockaddr_storage *addr, int addrlen,
-                      int qid, const std::string &name, int rrtype);
-  void ProcessPacket(int fd, struct sockaddr_storage *addr, socklen_t addrlen,
-                     byte *data, int len);
-  int  udpport_;
-  int  tcpport_;
-  int  udpfd_;
-  int  tcpfd_;
-  std::set<int>     connfds_;
-  std::vector<byte> reply_;
-  int               qid_;
-  unsigned char    *tcp_data_;
-  size_t            tcp_data_len_;
+  void           ProcessRequest(ares_socket_t fd, struct sockaddr_storage *addr,
+                                ares_socklen_t addrlen, const std::vector<byte> &req,
+                                const std::string &reqstr, int qid, const char *name,
+                                int rrtype);
+  void           ProcessPacket(ares_socket_t fd, struct sockaddr_storage *addr,
+                               ares_socklen_t addrlen, byte *data, int len);
+  unsigned short udpport_;
+  unsigned short tcpport_;
+  ares_socket_t  udpfd_;
+  ares_socket_t  tcpfd_;
+  std::set<ares_socket_t> connfds_;
+  std::vector<byte>       exact_reply_;
+  const DNSPacket        *reply_;
+  std::string             expected_request_;
+  int                     qid_;
+  unsigned char          *tcp_data_;
+  size_t                  tcp_data_len_;
 };
 
 // Test fixture that uses a mock DNS server.
 class MockChannelOptsTest : public LibraryTest {
 public:
   MockChannelOptsTest(int count, int family, bool force_tcp,
-                      struct ares_options *givenopts, int optmask);
+                      bool honor_sysconfig, struct ares_options *givenopts,
+                      int optmask);
   ~MockChannelOptsTest();
 
   // Process all pending work on ares-owned and mock-server-owned file
   // descriptors.
-  void Process();
+  void ProcessAltChannel(ares_channel_t *chan, unsigned int cancel_ms = 0);
+  void Process(unsigned int cancel_ms = 0);
 
 protected:
   // NiceMockServer doesn't complain about uninteresting calls.
   typedef testing::NiceMock<MockServer>                NiceMockServer;
   typedef std::vector<std::unique_ptr<NiceMockServer>> NiceMockServers;
 
-  std::set<int>                                        fds() const;
-  void                                                 ProcessFD(int fd);
+  std::set<ares_socket_t>                              fds() const;
+  void                   ProcessFD(ares_socket_t fd);
 
-  static NiceMockServers BuildServers(int count, int family, int base_port);
+  static NiceMockServers BuildServers(int count, int family,
+                                      unsigned short base_port);
 
   NiceMockServers        servers_;
   // Convenience reference to first server.
   NiceMockServer        &server_;
-  ares_channel           channel_;
+  ares_channel_t        *channel_;
 };
 
 class MockChannelTest
@@ -260,7 +353,8 @@ class MockChannelTest
     public ::testing::WithParamInterface<std::pair<int, bool>> {
 public:
   MockChannelTest()
-    : MockChannelOptsTest(1, GetParam().first, GetParam().second, nullptr, 0)
+    : MockChannelOptsTest(1, GetParam().first, GetParam().second, false,
+                          nullptr, 0)
   {
   }
 };
@@ -268,7 +362,8 @@ public:
 class MockUDPChannelTest : public MockChannelOptsTest,
                            public ::testing::WithParamInterface<int> {
 public:
-  MockUDPChannelTest() : MockChannelOptsTest(1, GetParam(), false, nullptr, 0)
+  MockUDPChannelTest()
+    : MockChannelOptsTest(1, GetParam(), false, false, nullptr, 0)
   {
   }
 };
@@ -276,7 +371,76 @@ public:
 class MockTCPChannelTest : public MockChannelOptsTest,
                            public ::testing::WithParamInterface<int> {
 public:
-  MockTCPChannelTest() : MockChannelOptsTest(1, GetParam(), true, nullptr, 0)
+  MockTCPChannelTest()
+    : MockChannelOptsTest(1, GetParam(), true, false, nullptr, 0)
+  {
+  }
+};
+
+class MockEventThreadOptsTest : public MockChannelOptsTest {
+public:
+  MockEventThreadOptsTest(int count, ares_evsys_t evsys, int family,
+                          bool force_tcp, struct ares_options *givenopts,
+                          int optmask)
+    : MockChannelOptsTest(count, family, force_tcp, false,
+                          FillOptionsET(&evopts_, givenopts, evsys),
+                          optmask | ARES_OPT_EVENT_THREAD)
+  {
+  }
+
+  ~MockEventThreadOptsTest()
+  {
+  }
+
+  static struct ares_options *FillOptionsET(struct ares_options *opts,
+                                            struct ares_options *givenopts,
+                                            ares_evsys_t         evsys)
+  {
+    if (givenopts) {
+      memcpy(opts, givenopts, sizeof(*opts));
+    } else {
+      memset(opts, 0, sizeof(*opts));
+    }
+    opts->evsys = evsys;
+    return opts;
+  }
+
+  void Process(unsigned int cancel_ms = 0);
+
+private:
+  struct ares_options evopts_;
+};
+
+class MockEventThreadTest
+  : public MockEventThreadOptsTest,
+    public ::testing::WithParamInterface<std::tuple<ares_evsys_t, int, bool>> {
+public:
+  MockEventThreadTest()
+    : MockEventThreadOptsTest(1, std::get<0>(GetParam()),
+                              std::get<1>(GetParam()), std::get<2>(GetParam()),
+                              nullptr, 0)
+  {
+  }
+};
+
+class MockUDPEventThreadTest
+  : public MockEventThreadOptsTest,
+    public ::testing::WithParamInterface<std::tuple<ares_evsys_t, int>> {
+public:
+  MockUDPEventThreadTest()
+    : MockEventThreadOptsTest(1, std::get<0>(GetParam()),
+                              std::get<1>(GetParam()), false, nullptr, 0)
+  {
+  }
+};
+
+class MockTCPEventThreadTest
+  : public MockEventThreadOptsTest,
+    public ::testing::WithParamInterface<std::tuple<ares_evsys_t, int>> {
+public:
+  MockTCPEventThreadTest()
+    : MockEventThreadOptsTest(1, std::get<0>(GetParam()),
+                              std::get<1>(GetParam()), true, nullptr, 0)
   {
   }
 };
@@ -292,6 +456,13 @@ ACTION_P2(SetReply, mockserver, reply)
   mockserver->SetReply(reply);
 }
 
+// gMock action to set the reply for a mock server, as well as the request (in
+// string form) that the server should expect to receive.
+ACTION_P3(SetReplyExpRequest, mockserver, reply, request)
+{
+  mockserver->SetReplyExpRequest(reply, request);
+}
+
 ACTION_P2(SetReplyQID, mockserver, qid)
 {
   mockserver->SetReplyQID(qid);
@@ -304,7 +475,7 @@ ACTION_P2(CancelChannel, mockserver, channel)
 }
 
 // gMock action to disconnect all connections.
-ACTION_P2(Disconnect, mockserver)
+ACTION_P(Disconnect, mockserver)
 {
   mockserver->Disconnect();
 }
@@ -340,6 +511,51 @@ struct HostResult {
 };
 
 std::ostream &operator<<(std::ostream &os, const HostResult &result);
+
+// C++ wrapper for ares_dns_record_t.
+struct AresDnsRecord {
+  ~AresDnsRecord()
+  {
+    ares_dns_record_destroy(dnsrec_);
+    dnsrec_ = NULL;
+  }
+
+  AresDnsRecord() : dnsrec_(NULL)
+  {
+  }
+
+  void SetDnsRecord(const ares_dns_record_t *dnsrec)
+  {
+    if (dnsrec_ != NULL) {
+      ares_dns_record_destroy(dnsrec_);
+    }
+    if (dnsrec == NULL) {
+      return;
+    }
+    dnsrec_ = ares_dns_record_duplicate(dnsrec);
+  }
+
+  ares_dns_record_t *dnsrec_ = NULL;
+};
+
+std::ostream &operator<<(std::ostream &os, const AresDnsRecord &result);
+
+// Structure that describes the result of an ares_host_callback invocation.
+struct QueryResult {
+  QueryResult() : done_(false), status_(ARES_SUCCESS), timeouts_(0)
+  {
+  }
+
+  // Whether the callback has been invoked.
+  bool          done_;
+  // Explicitly provided result information.
+  ares_status_t status_;
+  size_t        timeouts_;
+  // Contents of the ares_dns_record_t structure if provided
+  AresDnsRecord dnsrec_;
+};
+
+std::ostream &operator<<(std::ostream &os, const QueryResult &result);
 
 // Structure that describes the result of an ares_callback invocation.
 struct SearchResult {
@@ -401,15 +617,19 @@ std::ostream &operator<<(std::ostream &os, const AddrInfoResult &result);
 // structures.
 void          HostCallback(void *data, int status, int timeouts,
                            struct hostent *hostent);
+void          QueryCallback(void *data, ares_status_t status, size_t timeouts,
+                            const ares_dns_record_t *dnsrec);
 void SearchCallback(void *data, int status, int timeouts, unsigned char *abuf,
                     int alen);
+void SearchCallbackDnsRec(void *data, ares_status_t status, size_t timeouts,
+                          const ares_dns_record_t *dnsrec);
 void NameInfoCallback(void *data, int status, int timeouts, char *node,
                       char *service);
 void AddrInfoCallback(void *data, int status, int timeouts,
                       struct ares_addrinfo *res);
 
 // Retrieve the name servers used by a channel.
-std::vector<std::string> GetNameServers(ares_channel channel);
+std::string GetNameServers(ares_channel_t *channel);
 
 // RAII class to temporarily create a directory of a given name.
 class TransientDir {
@@ -559,6 +779,59 @@ int RunInContainer(ContainerFilesystem *fs, const std::string &hostname,
     }                                                                         \
     int ICLASS_NAME(casename, testname)::InnerTestBody()
 
+
+/* Derived from googletest/include/gtest/gtest-param-test.h, specifically the
+ * TEST_P() macro, and some fixes to try to be compatible with different
+ * versions. */
+#  ifndef GTEST_ATTRIBUTE_UNUSED_
+#    define GTEST_ATTRIBUTE_UNUSED_
+#  endif
+#  ifndef GTEST_INTERNAL_ATTRIBUTE_MAYBE_UNUSED
+#    define GTEST_INTERNAL_ATTRIBUTE_MAYBE_UNUSED
+#  endif
+#  define CONTAINED_TEST_P(test_suite_name, test_name, hostname, domainname, \
+                           files)                                            \
+    class GTEST_TEST_CLASS_NAME_(test_suite_name, test_name)                 \
+      : public test_suite_name {                                             \
+    public:                                                                  \
+      GTEST_TEST_CLASS_NAME_(test_suite_name, test_name)()                   \
+      {                                                                      \
+      }                                                                      \
+      int  InnerTestBody();                                                  \
+      void TestBody()                                                        \
+      {                                                                      \
+        ContainerFilesystem chroot(files, "..");                             \
+        VoidToIntFn         fn = [this](void) -> int {                       \
+          ares_reinit(this->channel_);                               \
+          ares_sleep_time(100);                                      \
+          return this->InnerTestBody();                              \
+        };                                                                   \
+        EXPECT_EQ(0, RunInContainer(&chroot, hostname, domainname, fn));     \
+      }                                                                      \
+                                                                             \
+    private:                                                                 \
+      static int AddToRegistry()                                             \
+      {                                                                      \
+        ::testing::UnitTest::GetInstance()                                   \
+          ->parameterized_test_registry()                                    \
+          .GetTestSuitePatternHolder<test_suite_name>(                       \
+            GTEST_STRINGIFY_(test_suite_name),                               \
+            ::testing::internal::CodeLocation(__FILE__, __LINE__))           \
+          ->AddTestPattern(                                                  \
+            GTEST_STRINGIFY_(test_suite_name), GTEST_STRINGIFY_(test_name),  \
+            new ::testing::internal::TestMetaFactory<GTEST_TEST_CLASS_NAME_( \
+              test_suite_name, test_name)>(),                                \
+            ::testing::internal::CodeLocation(__FILE__, __LINE__));          \
+        return 0;                                                            \
+      }                                                                      \
+      GTEST_INTERNAL_ATTRIBUTE_MAYBE_UNUSED static int                       \
+        gtest_registering_dummy_ GTEST_ATTRIBUTE_UNUSED_;                    \
+    };                                                                       \
+    int GTEST_TEST_CLASS_NAME_(test_suite_name,                              \
+                               test_name)::gtest_registering_dummy_ =        \
+      GTEST_TEST_CLASS_NAME_(test_suite_name, test_name)::AddToRegistry();   \
+    int GTEST_TEST_CLASS_NAME_(test_suite_name, test_name)::InnerTestBody()
+
 #endif
 
 /* Assigns virtual IO functions to a channel. These functions simply call
@@ -572,7 +845,7 @@ public:
   static const ares_socket_functions default_functions;
 
 private:
-  ares_channel channel_;
+  ares_channel_t *channel_;
 };
 
 /*

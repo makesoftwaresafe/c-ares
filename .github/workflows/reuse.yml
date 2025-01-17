@@ -6,12 +6,7 @@ name: REUSE compliance
 
 on:
   push:
-    branches:
-    - main
-    - '*/ci'
   pull_request:
-    branches:
-    - main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -22,7 +17,8 @@ permissions: {}
 jobs:
   check:
     runs-on: ubuntu-latest
+    name: REUSE compliance
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: REUSE Compliance Check
       uses: fsfe/reuse-action@v1
